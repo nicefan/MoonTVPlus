@@ -1,0 +1,281 @@
+name: Build MoonTVPlus Windows x64 Desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: moontvplus-windows-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows-x64:
+    name: Build Windows x64 Desktop
+    runs-on: windows-2022
+
+    env:
+      NEXT_PUBLIC_STORAGE_TYPE: upstash
+      NODE_ENV: production
+      UPSTASH_URL: ${{ secrets.UPSTASH_URL }}
+      UPSTASH_TOKEN: ${{ secrets.UPSTASH_TOKEN }}
+      USERNAME: ${{ secrets.USERNAME }}
+      PASSWORD: ${{ secrets.PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.14.0
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Validate required secrets
+        shell: pwsh
+        run: |
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace($env:UPSTASH_URL)) { $missing += 'UPSTASH_URL' }
+          if ([string]::IsNullOrWhiteSpace($env:UPSTASH_TOKEN)) { $missing += 'UPSTASH_TOKEN' }
+          if ([string]::IsNullOrWhiteSpace($env:USERNAME)) { $missing += 'USERNAME' }
+          if ([string]::IsNullOrWhiteSpace($env:PASSWORD)) { $missing += 'PASSWORD' }
+          if ($missing.Count -gt 0) {
+            throw "Missing GitHub Actions secrets: $($missing -join ', ')"
+          }
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build MoonTVPlus standalone
+        run: pnpm build
+
+      - name: Prepare desktop package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path desktop-build | Out-Null
+          New-Item -ItemType Directory -Force -Path desktop-build/server | Out-Null
+
+          Copy-Item -Recurse -Force .next/standalone/* desktop-build/server/
+
+          New-Item -ItemType Directory -Force -Path desktop-build/server/.next | Out-Null
+          Copy-Item -Recurse -Force .next/static desktop-build/server/.next/static
+
+          if (Test-Path public) {
+            Copy-Item -Recurse -Force public desktop-build/server/public
+          }
+
+          $runtimeConfig = @{
+            NEXT_PUBLIC_STORAGE_TYPE = 'upstash'
+            UPSTASH_URL = $env:UPSTASH_URL
+            UPSTASH_TOKEN = $env:UPSTASH_TOKEN
+            USERNAME = $env:USERNAME
+            PASSWORD = $env:PASSWORD
+          } | ConvertTo-Json -Compress
+
+          Set-Content -Path desktop-build/runtime-config.json -Value $runtimeConfig -Encoding UTF8
+
+          @'
+          const { app, BrowserWindow, dialog } = require('electron');
+          const { spawn } = require('child_process');
+          const fs = require('fs');
+          const http = require('http');
+          const net = require('net');
+          const path = require('path');
+
+          let serverProcess;
+          let mainWindow;
+          let shuttingDown = false;
+
+          function getFreePort() {
+            return new Promise((resolve, reject) => {
+              const server = net.createServer();
+              server.unref();
+              server.on('error', reject);
+              server.listen(0, '127.0.0.1', () => {
+                const address = server.address();
+                const port = address.port;
+                server.close(() => resolve(port));
+              });
+            });
+          }
+
+          function waitForServer(port, timeoutMs = 90000) {
+            const startedAt = Date.now();
+            return new Promise((resolve, reject) => {
+              const probe = () => {
+                const req = http.get({
+                  hostname: '127.0.0.1',
+                  port,
+                  path: '/',
+                  timeout: 1500,
+                }, (res) => {
+                  res.resume();
+                  resolve();
+                });
+
+                req.on('error', () => {
+                  if (Date.now() - startedAt >= timeoutMs) {
+                    reject(new Error(`MoonTVPlus server did not start in time: 127.0.0.1:${port}`));
+                  } else {
+                    setTimeout(probe, 500);
+                  }
+                });
+
+                req.on('timeout', () => req.destroy());
+              };
+
+              probe();
+            });
+          }
+
+          function readRuntimeConfig() {
+            const configPath = path.join(__dirname, 'runtime-config.json');
+            const text = fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, '');
+            return JSON.parse(text);
+          }
+
+          async function startServer() {
+            const port = await getFreePort();
+            const config = readRuntimeConfig();
+            const serverDir = path.join(process.resourcesPath, 'server');
+            const serverEntry = path.join(serverDir, 'server.js');
+
+            if (!fs.existsSync(serverEntry)) {
+              throw new Error(`Missing Next.js standalone server: ${serverEntry}`);
+            }
+
+            const env = {
+              ...process.env,
+              ...config,
+              ELECTRON_RUN_AS_NODE: '1',
+              NODE_ENV: 'production',
+              HOSTNAME: '127.0.0.1',
+              PORT: String(port),
+            };
+
+            serverProcess = spawn(process.execPath, [serverEntry], {
+              cwd: serverDir,
+              env,
+              windowsHide: true,
+              stdio: ['ignore', 'pipe', 'pipe'],
+            });
+
+            serverProcess.stdout.on('data', (data) => console.log(`[server] ${data}`));
+            serverProcess.stderr.on('data', (data) => console.error(`[server] ${data}`));
+
+            serverProcess.on('exit', (code) => {
+              console.error(`MoonTVPlus server exited (code=${code})`);
+              if (!shuttingDown && mainWindow) {
+                dialog.showErrorBox('MoonTVPlus', `Local server exited unexpectedly (code=${code}).`);
+              }
+            });
+
+            await waitForServer(port);
+            return port;
+          }
+
+          async function createWindow() {
+            const port = await startServer();
+
+            mainWindow = new BrowserWindow({
+              width: 1440,
+              height: 900,
+              minWidth: 1024,
+              minHeight: 640,
+              autoHideMenuBar: true,
+              webPreferences: {
+                contextIsolation: true,
+                nodeIntegration: false,
+                sandbox: true,
+              },
+            });
+
+            await mainWindow.loadURL(`http://127.0.0.1:${port}`);
+          }
+
+          app.whenReady().then(async () => {
+            try {
+              await createWindow();
+            } catch (error) {
+              console.error(error);
+              dialog.showErrorBox('MoonTVPlus startup failed', error?.stack || String(error));
+              app.quit();
+            }
+          });
+
+          app.on('window-all-closed', () => {
+            if (process.platform !== 'darwin') app.quit();
+          });
+
+          app.on('before-quit', () => {
+            shuttingDown = true;
+            if (serverProcess && !serverProcess.killed) {
+              serverProcess.kill();
+            }
+          });
+          '@ | Set-Content -Path desktop-build/main.cjs -Encoding UTF8
+
+          @'
+          {
+            "name": "moontvplus-desktop",
+            "version": "1.0.0",
+            "private": true,
+            "main": "main.cjs",
+            "devDependencies": {
+              "electron": "43.2.0",
+              "electron-builder": "26.0.12"
+            },
+            "build": {
+              "appId": "com.moontvplus.desktop",
+              "productName": "MoonTVPlus",
+              "asar": true,
+              "files": [
+                "main.cjs",
+                "runtime-config.json"
+              ],
+              "extraResources": [
+                {
+                  "from": "server",
+                  "to": "server"
+                }
+              ],
+              "win": {
+                "target": [
+                  {
+                    "target": "nsis",
+                    "arch": ["x64"]
+                  }
+                ]
+              },
+              "nsis": {
+                "oneClick": false,
+                "allowToChangeInstallationDirectory": true
+              },
+              "artifactName": "MoonTVPlus-${version}-windows-x64.${ext}"
+            }
+          }
+          '@ | Set-Content -Path desktop-build/package.json -Encoding UTF8
+
+      - name: Install desktop packaging dependencies
+        working-directory: desktop-build
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build Windows x64 installer
+        working-directory: desktop-build
+        run: pnpm exec electron-builder --win nsis --x64
+
+      - name: Upload Windows x64 installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: MoonTVPlus-windows-x64
+          path: desktop-build/dist/*.exe
+          if-no-files-found: error
+          retention-days: 14
