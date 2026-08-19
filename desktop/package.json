@@ -1,0 +1,50 @@
+{
+  "name": "moontvplus-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "dist:win": "electron-builder --win nsis --x64"
+  },
+  "devDependencies": {
+    "electron": "43.2.0",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "com.moontvplus.desktop",
+    "productName": "MoonTVPlus",
+    "asar": true,
+    "files": [
+      "main.cjs"
+    ],
+    "extraResources": [
+      {
+        "from": "runtime/server",
+        "to": "server",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "runtime/node",
+        "to": "node",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "runtime/runtime-config.json",
+        "to": "runtime-config.json"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "artifactName": "MoonTVPlus-${version}-windows-x64-${env.BUILD_ID}.${ext}"
+  }
+}
