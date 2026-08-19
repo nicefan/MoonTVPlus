@@ -1,5 +1,6 @@
 const { app, BrowserWindow, dialog } = require('electron');
 const { spawn } = require('child_process');
+const extract = require('extract-zip');
 const fs = require('fs');
 const http = require('http');
 const net = require('net');
@@ -71,14 +72,38 @@ function readRuntimeConfig() {
   return JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
 }
 
+async function ensureServerExtracted(config) {
+  const buildId = config.BUILD_ID || 'unknown';
+  const runtimeRoot = path.join(app.getPath('userData'), 'runtime', buildId);
+  const serverDir = path.join(runtimeRoot, 'server');
+  const serverEntry = path.join(serverDir, 'server.js');
+  const nextPackage = path.join(serverDir, 'node_modules', 'next', 'package.json');
+
+  if (fs.existsSync(serverEntry) && fs.existsSync(nextPackage)) {
+    return serverDir;
+  }
+
+  const archive = path.join(process.resourcesPath, 'server.zip');
+  if (!fs.existsSync(archive)) throw new Error(`Missing packaged server archive: ${archive}`);
+
+  fs.rmSync(runtimeRoot, { recursive: true, force: true });
+  fs.mkdirSync(serverDir, { recursive: true });
+  appendLog(`Extracting server archive to: ${serverDir}\n`);
+  await extract(archive, { dir: serverDir });
+
+  if (!fs.existsSync(serverEntry)) throw new Error(`Extracted server.js is missing: ${serverEntry}`);
+  if (!fs.existsSync(nextPackage)) throw new Error(`Extracted Next runtime is missing: ${nextPackage}`);
+
+  return serverDir;
+}
+
 async function startServer() {
   const port = await getFreePort();
   const config = readRuntimeConfig();
-  const serverDir = path.join(process.resourcesPath, 'server');
+  const serverDir = await ensureServerExtracted(config);
   const serverEntry = path.join(serverDir, 'server.js');
   const nodeExe = path.join(process.resourcesPath, 'node', 'node.exe');
 
-  if (!fs.existsSync(serverEntry)) throw new Error(`Missing Next.js server: ${serverEntry}`);
   if (!fs.existsSync(nodeExe)) throw new Error(`Missing bundled Node runtime: ${nodeExe}`);
 
   const env = {
