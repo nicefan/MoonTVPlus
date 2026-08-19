@@ -60,29 +60,32 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path desktop-build/server | Out-Null
           New-Item -ItemType Directory -Force -Path desktop-build/node | Out-Null
-          New-Item -ItemType Directory -Force -Path desktop-build/runtime-deps | Out-Null
 
           Copy-Item -Recurse -Force .next/standalone/* desktop-build/server/
           New-Item -ItemType Directory -Force -Path desktop-build/server/.next | Out-Null
           Copy-Item -Recurse -Force .next/static desktop-build/server/.next/static
           if (Test-Path public) { Copy-Item -Recurse -Force public desktop-build/server/public }
 
-          # Install styled-jsx into a real npm node_modules tree instead of copying
-          # pnpm symlinks/virtual-store paths. Resolve the exact version required by
-          # the installed Next package so it always matches Next 14.x.
-          $styledJsxVersion = node -e "const p=require('next/package.json');process.stdout.write(p.dependencies['styled-jsx'])"
-          Write-Host "Next requires styled-jsx: $styledJsxVersion"
-          Push-Location desktop-build/runtime-deps
-          npm init -y | Out-Null
-          npm install --omit=dev --no-audit --no-fund "styled-jsx@$styledJsxVersion"
+          # The pnpm + Next 14 standalone trace can omit transitive runtime modules
+          # such as styled-jsx and @swc/helpers. For the desktop build, install a
+          # complete, real production node_modules tree next to server.js instead
+          # of relying on the traced pnpm symlink structure.
+          Copy-Item -Force package.json desktop-build/server/package.json
+          Push-Location desktop-build/server
+          if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
+          npm install --omit=dev --no-audit --no-fund --legacy-peer-deps
           Pop-Location
 
-          if (!(Test-Path 'desktop-build/runtime-deps/node_modules/styled-jsx/package.json')) {
+          if (!(Test-Path 'desktop-build/server/node_modules/next/package.json')) {
+            throw 'next runtime dependency was not installed correctly'
+          }
+          if (!(Test-Path 'desktop-build/server/node_modules/styled-jsx/package.json')) {
             throw 'styled-jsx runtime dependency was not installed correctly'
           }
+          if (!(Test-Path 'desktop-build/server/node_modules/@swc/helpers/package.json')) {
+            throw '@swc/helpers runtime dependency was not installed correctly'
+          }
 
-          # Bundle the standard x64 Node runtime used by the build runner.
-          # The installed desktop app therefore does NOT require Node.js to be installed.
           $nodeExe = (Get-Command node).Source
           Copy-Item -Force $nodeExe desktop-build/node/node.exe
           & desktop-build/node/node.exe --version
@@ -182,11 +185,9 @@ jobs:
             const serverDir = path.join(process.resourcesPath, 'server');
             const serverEntry = path.join(serverDir, 'server.js');
             const nodeExe = path.join(process.resourcesPath, 'node', 'node.exe');
-            const runtimeNodeModules = path.join(process.resourcesPath, 'runtime-deps', 'node_modules');
 
             if (!fs.existsSync(serverEntry)) throw new Error(`Missing Next.js standalone server: ${serverEntry}`);
             if (!fs.existsSync(nodeExe)) throw new Error(`Missing bundled Node runtime: ${nodeExe}`);
-            if (!fs.existsSync(runtimeNodeModules)) throw new Error(`Missing runtime dependencies: ${runtimeNodeModules}`);
 
             const env = {
               ...process.env,
@@ -194,11 +195,10 @@ jobs:
               NODE_ENV: 'production',
               HOSTNAME: '127.0.0.1',
               PORT: String(port),
-              NODE_PATH: runtimeNodeModules + (process.env.NODE_PATH ? path.delimiter + process.env.NODE_PATH : ''),
             };
 
             appendLog(`\n=== MoonTVPlus startup ${new Date().toISOString()} ===\n`);
-            appendLog(`Node: ${nodeExe}\nServer: ${serverEntry}\nPort: ${port}\nNODE_PATH: ${env.NODE_PATH}\n`);
+            appendLog(`Node: ${nodeExe}\nServer: ${serverEntry}\nPort: ${port}\n`);
 
             serverProcess = spawn(nodeExe, [serverEntry], {
               cwd: serverDir,
@@ -272,8 +272,7 @@ jobs:
               "files": ["main.cjs", "runtime-config.json"],
               "extraResources": [
                 { "from": "server", "to": "server" },
-                { "from": "node", "to": "node" },
-                { "from": "runtime-deps", "to": "runtime-deps" }
+                { "from": "node", "to": "node" }
               ],
               "win": {
                 "target": [{ "target": "nsis", "arch": ["x64"] }]
@@ -287,26 +286,26 @@ jobs:
           }
           '@ | Set-Content -Path desktop-build/package.json -Encoding UTF8
 
-      - name: Smoke test standalone with bundled Node
+      - name: Smoke test desktop server
         shell: pwsh
         run: |
+          Push-Location desktop-build/server
+          & ../node/node.exe -e "console.log('next:',require.resolve('next/package.json'));console.log('styled-jsx:',require.resolve('styled-jsx/package.json'));console.log('@swc/helpers:',require.resolve('@swc/helpers/package.json'))"
+          Pop-Location
+
           $env:HOSTNAME = '127.0.0.1'
           $env:PORT = '32109'
-          $env:NODE_PATH = (Resolve-Path 'desktop-build/runtime-deps/node_modules').Path
-          Write-Host "NODE_PATH=$env:NODE_PATH"
-          & desktop-build/node/node.exe -e "console.log('styled-jsx:', require.resolve('styled-jsx/package.json'))"
-
           $proc = Start-Process -FilePath "desktop-build/node/node.exe" -ArgumentList "server.js" -WorkingDirectory "desktop-build/server" -PassThru -RedirectStandardOutput "desktop-build/smoke-out.log" -RedirectStandardError "desktop-build/smoke-err.log"
-          Start-Sleep -Seconds 5
+          Start-Sleep -Seconds 7
           if ($proc.HasExited) {
-            Write-Host 'Standalone server failed during CI smoke test.'
+            Write-Host 'Desktop server failed during CI smoke test.'
             if (Test-Path desktop-build/smoke-out.log) { Get-Content desktop-build/smoke-out.log }
             if (Test-Path desktop-build/smoke-err.log) { Get-Content desktop-build/smoke-err.log }
-            throw "MoonTVPlus standalone server exited with code $($proc.ExitCode)"
+            throw "MoonTVPlus desktop server exited with code $($proc.ExitCode)"
           }
           try {
-            Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:32109/" -TimeoutSec 15 | Out-Null
-            Write-Host 'Standalone smoke test passed.'
+            Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:32109/" -TimeoutSec 20 | Out-Null
+            Write-Host 'Desktop server smoke test passed.'
           } finally {
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           }
