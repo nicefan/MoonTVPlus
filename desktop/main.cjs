@@ -10,11 +10,20 @@ let serverProcess;
 let mainWindow;
 let serverOutput = '';
 
+function ts() {
+  return new Date().toISOString();
+}
+
 function appendLog(text) {
   try {
     const logDir = path.join(app.getPath('userData'), 'logs');
     fs.mkdirSync(logDir, { recursive: true });
-    fs.appendFileSync(path.join(logDir, 'server.log'), text);
+    const lines = String(text)
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .map((line) => `[${ts()}] ${line}\n`)
+      .join('');
+    if (lines) fs.appendFileSync(path.join(logDir, 'server.log'), lines);
   } catch (_) {}
 }
 
@@ -72,29 +81,72 @@ function readRuntimeConfig() {
   return JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
 }
 
+function isValidServerDir(dir) {
+  return fs.existsSync(path.join(dir, 'server.js')) &&
+    fs.existsSync(path.join(dir, 'node_modules', 'next', 'package.json'));
+}
+
+function findExtractedServerDir(root) {
+  if (isValidServerDir(root)) return root;
+
+  const candidates = [
+    path.join(root, 'server'),
+    path.join(root, 'runtime', 'server'),
+  ];
+  for (const candidate of candidates) {
+    if (isValidServerDir(candidate)) return candidate;
+  }
+
+  try {
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const candidate = path.join(root, entry.name);
+      if (isValidServerDir(candidate)) return candidate;
+    }
+  } catch (_) {}
+
+  return null;
+}
+
 async function ensureServerExtracted(config) {
   const buildId = config.BUILD_ID || 'unknown';
-  const runtimeRoot = path.join(app.getPath('userData'), 'runtime', buildId);
-  const serverDir = path.join(runtimeRoot, 'server');
-  const serverEntry = path.join(serverDir, 'server.js');
-  const nextPackage = path.join(serverDir, 'node_modules', 'next', 'package.json');
-
-  if (fs.existsSync(serverEntry) && fs.existsSync(nextPackage)) {
-    return serverDir;
-  }
+  const runtimeBase = path.join(app.getPath('userData'), 'runtime');
+  const runtimeRoot = path.join(runtimeBase, buildId);
+  const existing = findExtractedServerDir(runtimeRoot);
+  if (existing) return existing;
 
   const archive = path.join(process.resourcesPath, 'server.zip');
   if (!fs.existsSync(archive)) throw new Error(`Missing packaged server archive: ${archive}`);
 
-  fs.rmSync(runtimeRoot, { recursive: true, force: true });
-  fs.mkdirSync(serverDir, { recursive: true });
-  appendLog(`Extracting server archive to: ${serverDir}\n`);
-  await extract(archive, { dir: serverDir });
+  fs.mkdirSync(runtimeBase, { recursive: true });
+  const tempRoot = path.join(runtimeBase, `${buildId}.extract-${process.pid}-${Date.now()}`);
+  fs.mkdirSync(tempRoot, { recursive: true });
 
-  if (!fs.existsSync(serverEntry)) throw new Error(`Extracted server.js is missing: ${serverEntry}`);
-  if (!fs.existsSync(nextPackage)) throw new Error(`Extracted Next runtime is missing: ${nextPackage}`);
+  appendLog(`Extracting server archive to temporary directory: ${tempRoot}`);
+  try {
+    await extract(archive, { dir: tempRoot });
+    const extractedServerDir = findExtractedServerDir(tempRoot);
+    if (!extractedServerDir) {
+      const topLevel = fs.existsSync(tempRoot) ? fs.readdirSync(tempRoot).join(', ') : '(missing)';
+      throw new Error(`Extracted server runtime is invalid. Top-level entries: ${topLevel}`);
+    }
 
-  return serverDir;
+    const targetRoot = path.join(runtimeBase, `${buildId}-${Date.now()}`);
+    fs.renameSync(tempRoot, targetRoot);
+    const finalServerDir = findExtractedServerDir(targetRoot);
+    if (!finalServerDir) throw new Error(`Extracted runtime became invalid after activation: ${targetRoot}`);
+
+    appendLog(`Activated extracted runtime: ${finalServerDir}`);
+    return finalServerDir;
+  } catch (error) {
+    appendLog(`Runtime extraction failed: ${error?.stack || String(error)}`);
+    try {
+      fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
+    } catch (cleanupError) {
+      appendLog(`Temporary runtime cleanup failed: ${cleanupError?.message || cleanupError}`);
+    }
+    throw error;
+  }
 }
 
 async function startServer() {
@@ -114,8 +166,11 @@ async function startServer() {
     PORT: String(port),
   };
 
-  appendLog(`\n=== MoonTVPlus startup ${new Date().toISOString()} ===\n`);
-  appendLog(`Build: ${config.BUILD_ID || 'unknown'}\nNode: ${nodeExe}\nServer: ${serverEntry}\nPort: ${port}\n`);
+  appendLog(`=== MoonTVPlus startup ===`);
+  appendLog(`Build: ${config.BUILD_ID || 'unknown'}`);
+  appendLog(`Node: ${nodeExe}`);
+  appendLog(`Server: ${serverEntry}`);
+  appendLog(`Port: ${port}`);
 
   serverProcess = spawn(nodeExe, [serverEntry], {
     cwd: serverDir,
@@ -157,7 +212,7 @@ app.whenReady().then(async () => {
   try {
     await createWindow();
   } catch (error) {
-    appendLog(`\n[fatal] ${error?.stack || String(error)}\n`);
+    appendLog(`[fatal] ${error?.stack || String(error)}`);
     dialog.showErrorBox('MoonTVPlus startup failed', error?.stack || String(error));
     app.quit();
   }
