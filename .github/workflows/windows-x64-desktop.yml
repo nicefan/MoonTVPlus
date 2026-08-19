@@ -27,6 +27,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup build identifier
+        shell: pwsh
+        run: |
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $buildTime = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmm')
+          $buildId = "$shortSha-$buildTime"
+          "BUILD_ID=$buildId" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Build identifier: $buildId"
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -91,6 +100,7 @@ jobs:
             UPSTASH_TOKEN = $env:UPSTASH_TOKEN
             USERNAME = $env:USERNAME
             PASSWORD = $env:PASSWORD
+            BUILD_ID = $env:BUILD_ID
           } | ConvertTo-Json -Compress
           Set-Content -Path desktop-build/runtime-config.json -Value $runtimeConfig -Encoding UTF8
 
@@ -196,7 +206,7 @@ jobs:
             };
 
             appendLog(`\n=== MoonTVPlus startup ${new Date().toISOString()} ===\n`);
-            appendLog(`Node: ${nodeExe}\nServer: ${serverEntry}\nPort: ${port}\n`);
+            appendLog(`Build: ${config.BUILD_ID || 'unknown'}\nNode: ${nodeExe}\nServer: ${serverEntry}\nPort: ${port}\n`);
 
             serverProcess = spawn(nodeExe, [serverEntry], {
               cwd: serverDir,
@@ -253,45 +263,36 @@ jobs:
           });
           '@ | Set-Content -Path desktop-build/main.cjs -Encoding UTF8
 
-          @'
-          {
-            "name": "moontvplus-desktop",
-            "version": "1.0.0",
-            "private": true,
-            "main": "main.cjs",
-            "devDependencies": {
-              "electron": "43.2.0",
-              "electron-builder": "26.0.12"
-            },
-            "build": {
-              "appId": "com.moontvplus.desktop",
-              "productName": "MoonTVPlus",
-              "asar": true,
-              "disableDefaultIgnoredFiles": true,
-              "files": ["main.cjs", "runtime-config.json"],
-              "extraResources": [
-                {
-                  "from": "server",
-                  "to": "server",
-                  "filter": ["**/*"]
-                },
-                {
-                  "from": "node",
-                  "to": "node",
-                  "filter": ["**/*"]
-                }
-              ],
-              "win": {
-                "target": [{ "target": "nsis", "arch": ["x64"] }]
-              },
-              "nsis": {
-                "oneClick": false,
-                "allowToChangeInstallationDirectory": true
-              },
-              "artifactName": "MoonTVPlus-${version}-windows-x64.${ext}"
+          $desktopPackage = @{
+            name = 'moontvplus-desktop'
+            version = '1.0.0'
+            private = $true
+            main = 'main.cjs'
+            devDependencies = @{
+              electron = '43.2.0'
+              'electron-builder' = '26.0.12'
+            }
+            build = @{
+              appId = 'com.moontvplus.desktop'
+              productName = 'MoonTVPlus'
+              asar = $true
+              disableDefaultIgnoredFiles = $true
+              files = @('main.cjs', 'runtime-config.json')
+              extraResources = @(
+                @{ from = 'server'; to = 'server'; filter = @('**/*') },
+                @{ from = 'node'; to = 'node'; filter = @('**/*') }
+              )
+              win = @{
+                target = @(@{ target = 'nsis'; arch = @('x64') })
+              }
+              nsis = @{
+                oneClick = $false
+                allowToChangeInstallationDirectory = $true
+              }
+              artifactName = "MoonTVPlus-`${version}-windows-x64-$env:BUILD_ID.`${ext}"
             }
           }
-          '@ | Set-Content -Path desktop-build/package.json -Encoding UTF8
+          $desktopPackage | ConvertTo-Json -Depth 10 | Set-Content -Path desktop-build/package.json -Encoding UTF8
 
       - name: Smoke test desktop server
         shell: pwsh
@@ -345,7 +346,7 @@ jobs:
       - name: Upload Windows x64 installer
         uses: actions/upload-artifact@v4
         with:
-          name: MoonTVPlus-windows-x64
+          name: MoonTVPlus-windows-x64-${{ env.BUILD_ID }}
           path: desktop-build/dist/*.exe
           if-no-files-found: error
           retention-days: 14
