@@ -111,16 +111,10 @@ jobs:
             const startedAt = Date.now();
             return new Promise((resolve, reject) => {
               const probe = () => {
-                const req = http.get({
-                  hostname: '127.0.0.1',
-                  port,
-                  path: '/',
-                  timeout: 1500,
-                }, (res) => {
+                const req = http.get({ hostname: '127.0.0.1', port, path: '/', timeout: 1500 }, (res) => {
                   res.resume();
                   resolve();
                 });
-
                 req.on('error', () => {
                   if (Date.now() - startedAt >= timeoutMs) {
                     reject(new Error(`MoonTVPlus server did not start in time: 127.0.0.1:${port}`));
@@ -128,10 +122,8 @@ jobs:
                     setTimeout(probe, 500);
                   }
                 });
-
                 req.on('timeout', () => req.destroy());
               };
-
               probe();
             });
           }
@@ -170,7 +162,6 @@ jobs:
 
             serverProcess.stdout.on('data', (data) => console.log(`[server] ${data}`));
             serverProcess.stderr.on('data', (data) => console.error(`[server] ${data}`));
-
             serverProcess.on('exit', (code) => {
               console.error(`MoonTVPlus server exited (code=${code})`);
               if (!shuttingDown && mainWindow) {
@@ -184,7 +175,6 @@ jobs:
 
           async function createWindow() {
             const port = await startServer();
-
             mainWindow = new BrowserWindow({
               width: 1440,
               height: 900,
@@ -197,7 +187,6 @@ jobs:
                 sandbox: true,
               },
             });
-
             await mainWindow.loadURL(`http://127.0.0.1:${port}`);
           }
 
@@ -217,9 +206,7 @@ jobs:
 
           app.on('before-quit', () => {
             shuttingDown = true;
-            if (serverProcess && !serverProcess.killed) {
-              serverProcess.kill();
-            }
+            if (serverProcess && !serverProcess.killed) serverProcess.kill();
           });
           '@ | Set-Content -Path desktop-build/main.cjs -Encoding UTF8
 
@@ -237,23 +224,10 @@ jobs:
               "appId": "com.moontvplus.desktop",
               "productName": "MoonTVPlus",
               "asar": true,
-              "files": [
-                "main.cjs",
-                "runtime-config.json"
-              ],
-              "extraResources": [
-                {
-                  "from": "server",
-                  "to": "server"
-                }
-              ],
+              "files": ["main.cjs", "runtime-config.json"],
+              "extraResources": [{ "from": "server", "to": "server" }],
               "win": {
-                "target": [
-                  {
-                    "target": "nsis",
-                    "arch": ["x64"]
-                  }
-                ]
+                "target": [{ "target": "nsis", "arch": ["x64"] }]
               },
               "nsis": {
                 "oneClick": false,
@@ -266,11 +240,13 @@ jobs:
 
       - name: Install desktop packaging dependencies
         working-directory: desktop-build
-        run: pnpm install --no-frozen-lockfile
+        shell: pwsh
+        run: npm install --include=dev --no-audit --no-fund
 
       - name: Build Windows x64 installer
         working-directory: desktop-build
-        run: pnpm exec electron-builder --win nsis --x64
+        shell: pwsh
+        run: npx --no-install electron-builder --win nsis --x64
 
       - name: Upload Windows x64 installer
         uses: actions/upload-artifact@v4
