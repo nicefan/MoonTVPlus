@@ -13,6 +13,7 @@ concurrency:
 jobs:
   build-windows-x64:
     name: Build Windows x64 Desktop
+    if: github.ref == 'refs/heads/desktop'
     runs-on: windows-2022
 
     env:
@@ -58,41 +59,37 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:PASSWORD)) { $missing += 'PASSWORD' }
           if ($missing.Count -gt 0) { throw "Missing GitHub Actions secrets: $($missing -join ', ')" }
 
-      - name: Install dependencies
+      - name: Install MoonTVPlus dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Build MoonTVPlus standalone
         run: pnpm build
 
-      - name: Prepare desktop package
+      - name: Prepare desktop runtime
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path desktop-build/server | Out-Null
-          New-Item -ItemType Directory -Force -Path desktop-build/node | Out-Null
+          $runtimeRoot = 'desktop/runtime'
+          $serverRoot = "$runtimeRoot/server"
+          $nodeRoot = "$runtimeRoot/node"
 
-          Copy-Item -Recurse -Force .next/standalone/* desktop-build/server/
-          New-Item -ItemType Directory -Force -Path desktop-build/server/.next | Out-Null
-          Copy-Item -Recurse -Force .next/static desktop-build/server/.next/static
-          if (Test-Path public) { Copy-Item -Recurse -Force public desktop-build/server/public }
+          if (Test-Path $runtimeRoot) { Remove-Item -Recurse -Force $runtimeRoot }
+          New-Item -ItemType Directory -Force -Path $serverRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path $nodeRoot | Out-Null
 
-          # Install a complete real production dependency tree next to server.js.
-          Copy-Item -Force package.json desktop-build/server/package.json
-          Push-Location desktop-build/server
+          Copy-Item -Recurse -Force .next/standalone/* $serverRoot/
+          New-Item -ItemType Directory -Force -Path "$serverRoot/.next" | Out-Null
+          Copy-Item -Recurse -Force .next/static "$serverRoot/.next/static"
+          if (Test-Path public) { Copy-Item -Recurse -Force public "$serverRoot/public" }
+
+          Copy-Item -Force package.json "$serverRoot/package.json"
+          Push-Location $serverRoot
           if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
           npm install --omit=dev --no-audit --no-fund --legacy-peer-deps
+          & node -e "console.log('next:',require.resolve('next/package.json'));console.log('styled-jsx:',require.resolve('styled-jsx/package.json'));console.log('@swc/helpers:',require.resolve('@swc/helpers/package.json'))"
           Pop-Location
 
-          foreach ($modulePath in @(
-            'desktop-build/server/node_modules/next/package.json',
-            'desktop-build/server/node_modules/styled-jsx/package.json',
-            'desktop-build/server/node_modules/@swc/helpers/package.json'
-          )) {
-            if (!(Test-Path $modulePath)) { throw "Missing runtime dependency before packaging: $modulePath" }
-          }
-
           $nodeExe = (Get-Command node).Source
-          Copy-Item -Force $nodeExe desktop-build/node/node.exe
-          & desktop-build/node/node.exe --version
+          Copy-Item -Force $nodeExe "$nodeRoot/node.exe"
 
           $runtimeConfig = @{
             NEXT_PUBLIC_STORAGE_TYPE = 'upstash'
@@ -102,213 +99,19 @@ jobs:
             PASSWORD = $env:PASSWORD
             BUILD_ID = $env:BUILD_ID
           } | ConvertTo-Json -Compress
-          Set-Content -Path desktop-build/runtime-config.json -Value $runtimeConfig -Encoding UTF8
+          Set-Content -Path "$runtimeRoot/runtime-config.json" -Value $runtimeConfig -Encoding UTF8
 
-          @'
-          const { app, BrowserWindow, dialog } = require('electron');
-          const { spawn } = require('child_process');
-          const fs = require('fs');
-          const http = require('http');
-          const net = require('net');
-          const path = require('path');
-
-          let serverProcess;
-          let mainWindow;
-          let serverOutput = '';
-
-          function appendLog(text) {
-            try {
-              const logDir = path.join(app.getPath('userData'), 'logs');
-              fs.mkdirSync(logDir, { recursive: true });
-              fs.appendFileSync(path.join(logDir, 'server.log'), text);
-            } catch (_) {}
-          }
-
-          function getFreePort() {
-            return new Promise((resolve, reject) => {
-              const server = net.createServer();
-              server.unref();
-              server.on('error', reject);
-              server.listen(0, '127.0.0.1', () => {
-                const port = server.address().port;
-                server.close(() => resolve(port));
-              });
-            });
-          }
-
-          function waitForServer(port, timeoutMs = 30000) {
-            const startedAt = Date.now();
-            return new Promise((resolve, reject) => {
-              let finished = false;
-              const fail = (error) => {
-                if (finished) return;
-                finished = true;
-                reject(error);
-              };
-              const exitHandler = (code, signal) => {
-                fail(new Error(
-                  `MoonTVPlus server exited before startup (code=${code}, signal=${signal || 'none'}).\n\n` +
-                  (serverOutput || 'No server output was captured.')
-                ));
-              };
-              serverProcess.once('exit', exitHandler);
-
-              const probe = () => {
-                if (finished) return;
-                const req = http.get({ hostname: '127.0.0.1', port, path: '/', timeout: 1500 }, (res) => {
-                  res.resume();
-                  if (!finished) {
-                    finished = true;
-                    serverProcess.removeListener('exit', exitHandler);
-                    resolve();
-                  }
-                });
-                req.on('error', () => {
-                  if (Date.now() - startedAt >= timeoutMs) {
-                    fail(new Error(
-                      `MoonTVPlus server did not start in time: 127.0.0.1:${port}\n\n` +
-                      (serverOutput || 'No server output was captured.')
-                    ));
-                  } else {
-                    setTimeout(probe, 400);
-                  }
-                });
-                req.on('timeout', () => req.destroy());
-              };
-              probe();
-            });
-          }
-
-          function readRuntimeConfig() {
-            const configPath = path.join(__dirname, 'runtime-config.json');
-            return JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
-          }
-
-          async function startServer() {
-            const port = await getFreePort();
-            const config = readRuntimeConfig();
-            const serverDir = path.join(process.resourcesPath, 'server');
-            const serverEntry = path.join(serverDir, 'server.js');
-            const nodeExe = path.join(process.resourcesPath, 'node', 'node.exe');
-
-            if (!fs.existsSync(serverEntry)) throw new Error(`Missing Next.js standalone server: ${serverEntry}`);
-            if (!fs.existsSync(nodeExe)) throw new Error(`Missing bundled Node runtime: ${nodeExe}`);
-            if (!fs.existsSync(path.join(serverDir, 'node_modules', 'next', 'package.json'))) {
-              throw new Error(`Missing packaged Next runtime: ${path.join(serverDir, 'node_modules', 'next', 'package.json')}`);
-            }
-
-            const env = {
-              ...process.env,
-              ...config,
-              NODE_ENV: 'production',
-              HOSTNAME: '127.0.0.1',
-              PORT: String(port),
-            };
-
-            appendLog(`\n=== MoonTVPlus startup ${new Date().toISOString()} ===\n`);
-            appendLog(`Build: ${config.BUILD_ID || 'unknown'}\nNode: ${nodeExe}\nServer: ${serverEntry}\nPort: ${port}\n`);
-
-            serverProcess = spawn(nodeExe, [serverEntry], {
-              cwd: serverDir,
-              env,
-              windowsHide: true,
-              stdio: ['ignore', 'pipe', 'pipe'],
-            });
-
-            const capture = (prefix, data) => {
-              const text = `${prefix}${data.toString()}`;
-              serverOutput = (serverOutput + text).slice(-12000);
-              appendLog(text);
-            };
-            serverProcess.stdout.on('data', (data) => capture('[stdout] ', data));
-            serverProcess.stderr.on('data', (data) => capture('[stderr] ', data));
-
-            await waitForServer(port);
-            return port;
-          }
-
-          async function createWindow() {
-            const port = await startServer();
-            mainWindow = new BrowserWindow({
-              width: 1440,
-              height: 900,
-              minWidth: 1024,
-              minHeight: 640,
-              autoHideMenuBar: true,
-              webPreferences: {
-                contextIsolation: true,
-                nodeIntegration: false,
-                sandbox: true,
-              },
-            });
-            await mainWindow.loadURL(`http://127.0.0.1:${port}`);
-          }
-
-          app.whenReady().then(async () => {
-            try {
-              await createWindow();
-            } catch (error) {
-              appendLog(`\n[fatal] ${error?.stack || String(error)}\n`);
-              dialog.showErrorBox('MoonTVPlus startup failed', error?.stack || String(error));
-              app.quit();
-            }
-          });
-
-          app.on('window-all-closed', () => {
-            if (process.platform !== 'darwin') app.quit();
-          });
-
-          app.on('before-quit', () => {
-            if (serverProcess && !serverProcess.killed) serverProcess.kill();
-          });
-          '@ | Set-Content -Path desktop-build/main.cjs -Encoding UTF8
-
-          $desktopPackage = @{
-            name = 'moontvplus-desktop'
-            version = '1.0.0'
-            private = $true
-            main = 'main.cjs'
-            devDependencies = @{
-              electron = '43.2.0'
-              'electron-builder' = '26.0.12'
-            }
-            build = @{
-              appId = 'com.moontvplus.desktop'
-              productName = 'MoonTVPlus'
-              asar = $true
-              disableDefaultIgnoredFiles = $true
-              files = @('main.cjs', 'runtime-config.json')
-              extraResources = @(
-                @{ from = 'server'; to = 'server'; filter = @('**/*') },
-                @{ from = 'node'; to = 'node'; filter = @('**/*') }
-              )
-              win = @{
-                target = @(@{ target = 'nsis'; arch = @('x64') })
-              }
-              nsis = @{
-                oneClick = $false
-                allowToChangeInstallationDirectory = $true
-              }
-              artifactName = "MoonTVPlus-`${version}-windows-x64-$env:BUILD_ID.`${ext}"
-            }
-          }
-          $desktopPackage | ConvertTo-Json -Depth 10 | Set-Content -Path desktop-build/package.json -Encoding UTF8
-
-      - name: Smoke test desktop server
+      - name: Smoke test prepared runtime
         shell: pwsh
         run: |
-          Push-Location desktop-build/server
-          & ../node/node.exe -e "console.log('next:',require.resolve('next/package.json'));console.log('styled-jsx:',require.resolve('styled-jsx/package.json'));console.log('@swc/helpers:',require.resolve('@swc/helpers/package.json'))"
-          Pop-Location
-
           $env:HOSTNAME = '127.0.0.1'
           $env:PORT = '32109'
-          $proc = Start-Process -FilePath "desktop-build/node/node.exe" -ArgumentList "server.js" -WorkingDirectory "desktop-build/server" -PassThru -RedirectStandardOutput "desktop-build/smoke-out.log" -RedirectStandardError "desktop-build/smoke-err.log"
+          $proc = Start-Process -FilePath "desktop/runtime/node/node.exe" -ArgumentList "server.js" -WorkingDirectory "desktop/runtime/server" -PassThru -RedirectStandardOutput "desktop/smoke-out.log" -RedirectStandardError "desktop/smoke-err.log"
           Start-Sleep -Seconds 7
           if ($proc.HasExited) {
             Write-Host 'Desktop server failed during CI smoke test.'
-            if (Test-Path desktop-build/smoke-out.log) { Get-Content desktop-build/smoke-out.log }
-            if (Test-Path desktop-build/smoke-err.log) { Get-Content desktop-build/smoke-err.log }
+            if (Test-Path desktop/smoke-out.log) { Get-Content desktop/smoke-out.log }
+            if (Test-Path desktop/smoke-err.log) { Get-Content desktop/smoke-err.log }
             throw "MoonTVPlus desktop server exited with code $($proc.ExitCode)"
           }
           try {
@@ -318,35 +121,45 @@ jobs:
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           }
 
+      - name: Archive server runtime
+        shell: pwsh
+        run: |
+          $zip = 'desktop/runtime/server.zip'
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          Compress-Archive -Path 'desktop/runtime/server/*' -DestinationPath $zip -CompressionLevel Optimal
+          if (!(Test-Path $zip)) { throw 'server.zip was not created' }
+          $sizeMb = [math]::Round((Get-Item $zip).Length / 1MB, 2)
+          Write-Host "server.zip size: $sizeMb MB"
+          Remove-Item -Recurse -Force 'desktop/runtime/server'
+
       - name: Install desktop packaging dependencies
-        working-directory: desktop-build
+        working-directory: desktop
         shell: pwsh
         run: npm install --include=dev --no-audit --no-fund
 
       - name: Build Windows x64 installer
-        working-directory: desktop-build
+        working-directory: desktop
         shell: pwsh
-        run: npx --no-install electron-builder --win nsis --x64
+        run: npm run dist:win
 
-      - name: Verify packaged server dependencies
+      - name: Verify packaged desktop resources
         shell: pwsh
         run: |
-          $root = 'desktop-build/dist/win-unpacked/resources/server'
-          foreach ($modulePath in @(
-            "$root/server.js",
-            "$root/node_modules/next/package.json",
-            "$root/node_modules/styled-jsx/package.json",
-            "$root/node_modules/@swc/helpers/package.json"
+          $root = 'desktop/dist/win-unpacked/resources'
+          foreach ($file in @(
+            "$root/server.zip",
+            "$root/node/node.exe",
+            "$root/runtime-config.json"
           )) {
-            Write-Host "Checking packaged file: $modulePath"
-            if (!(Test-Path $modulePath)) { throw "Packaged runtime file missing: $modulePath" }
+            Write-Host "Checking packaged file: $file"
+            if (!(Test-Path $file)) { throw "Packaged desktop resource missing: $file" }
           }
-          Write-Host 'Packaged server dependency verification passed.'
+          Write-Host 'Packaged desktop resource verification passed.'
 
       - name: Upload Windows x64 installer
         uses: actions/upload-artifact@v4
         with:
           name: MoonTVPlus-windows-x64-${{ env.BUILD_ID }}
-          path: desktop-build/dist/*.exe
+          path: desktop/dist/*.exe
           if-no-files-found: error
           retention-days: 14
