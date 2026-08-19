@@ -47,9 +47,7 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:UPSTASH_TOKEN)) { $missing += 'UPSTASH_TOKEN' }
           if ([string]::IsNullOrWhiteSpace($env:USERNAME)) { $missing += 'USERNAME' }
           if ([string]::IsNullOrWhiteSpace($env:PASSWORD)) { $missing += 'PASSWORD' }
-          if ($missing.Count -gt 0) {
-            throw "Missing GitHub Actions secrets: $($missing -join ', ')"
-          }
+          if ($missing.Count -gt 0) { throw "Missing GitHub Actions secrets: $($missing -join ', ')" }
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -60,17 +58,19 @@ jobs:
       - name: Prepare desktop package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path desktop-build | Out-Null
           New-Item -ItemType Directory -Force -Path desktop-build/server | Out-Null
+          New-Item -ItemType Directory -Force -Path desktop-build/node | Out-Null
 
           Copy-Item -Recurse -Force .next/standalone/* desktop-build/server/
-
           New-Item -ItemType Directory -Force -Path desktop-build/server/.next | Out-Null
           Copy-Item -Recurse -Force .next/static desktop-build/server/.next/static
+          if (Test-Path public) { Copy-Item -Recurse -Force public desktop-build/server/public }
 
-          if (Test-Path public) {
-            Copy-Item -Recurse -Force public desktop-build/server/public
-          }
+          # Bundle the standard x64 Node runtime used by the build runner.
+          # The installed desktop app therefore does NOT require Node.js to be installed.
+          $nodeExe = (Get-Command node).Source
+          Copy-Item -Force $nodeExe desktop-build/node/node.exe
+          & desktop-build/node/node.exe --version
 
           $runtimeConfig = @{
             NEXT_PUBLIC_STORAGE_TYPE = 'upstash'
@@ -79,7 +79,6 @@ jobs:
             USERNAME = $env:USERNAME
             PASSWORD = $env:PASSWORD
           } | ConvertTo-Json -Compress
-
           Set-Content -Path desktop-build/runtime-config.json -Value $runtimeConfig -Encoding UTF8
 
           @'
@@ -93,6 +92,15 @@ jobs:
           let serverProcess;
           let mainWindow;
           let shuttingDown = false;
+          let serverOutput = '';
+
+          function appendLog(text) {
+            try {
+              const logDir = path.join(app.getPath('userData'), 'logs');
+              fs.mkdirSync(logDir, { recursive: true });
+              fs.appendFileSync(path.join(logDir, 'server.log'), text);
+            } catch (_) {}
+          }
 
           function getFreePort() {
             return new Promise((resolve, reject) => {
@@ -100,26 +108,49 @@ jobs:
               server.unref();
               server.on('error', reject);
               server.listen(0, '127.0.0.1', () => {
-                const address = server.address();
-                const port = address.port;
+                const port = server.address().port;
                 server.close(() => resolve(port));
               });
             });
           }
 
-          function waitForServer(port, timeoutMs = 90000) {
+          function waitForServer(port, timeoutMs = 30000) {
             const startedAt = Date.now();
             return new Promise((resolve, reject) => {
+              let finished = false;
+
+              const fail = (error) => {
+                if (finished) return;
+                finished = true;
+                reject(error);
+              };
+
+              const exitHandler = (code, signal) => {
+                fail(new Error(
+                  `MoonTVPlus server exited before startup (code=${code}, signal=${signal || 'none'}).\n\n` +
+                  (serverOutput || 'No server output was captured.')
+                ));
+              };
+              serverProcess.once('exit', exitHandler);
+
               const probe = () => {
+                if (finished) return;
                 const req = http.get({ hostname: '127.0.0.1', port, path: '/', timeout: 1500 }, (res) => {
                   res.resume();
-                  resolve();
+                  if (!finished) {
+                    finished = true;
+                    serverProcess.removeListener('exit', exitHandler);
+                    resolve();
+                  }
                 });
                 req.on('error', () => {
                   if (Date.now() - startedAt >= timeoutMs) {
-                    reject(new Error(`MoonTVPlus server did not start in time: 127.0.0.1:${port}`));
+                    fail(new Error(
+                      `MoonTVPlus server did not start in time: 127.0.0.1:${port}\n\n` +
+                      (serverOutput || 'No server output was captured.')
+                    ));
                   } else {
-                    setTimeout(probe, 500);
+                    setTimeout(probe, 400);
                   }
                 });
                 req.on('timeout', () => req.destroy());
@@ -130,8 +161,7 @@ jobs:
 
           function readRuntimeConfig() {
             const configPath = path.join(__dirname, 'runtime-config.json');
-            const text = fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, '');
-            return JSON.parse(text);
+            return JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
           }
 
           async function startServer() {
@@ -139,35 +169,36 @@ jobs:
             const config = readRuntimeConfig();
             const serverDir = path.join(process.resourcesPath, 'server');
             const serverEntry = path.join(serverDir, 'server.js');
+            const nodeExe = path.join(process.resourcesPath, 'node', 'node.exe');
 
-            if (!fs.existsSync(serverEntry)) {
-              throw new Error(`Missing Next.js standalone server: ${serverEntry}`);
-            }
+            if (!fs.existsSync(serverEntry)) throw new Error(`Missing Next.js standalone server: ${serverEntry}`);
+            if (!fs.existsSync(nodeExe)) throw new Error(`Missing bundled Node runtime: ${nodeExe}`);
 
             const env = {
               ...process.env,
               ...config,
-              ELECTRON_RUN_AS_NODE: '1',
               NODE_ENV: 'production',
               HOSTNAME: '127.0.0.1',
               PORT: String(port),
             };
 
-            serverProcess = spawn(process.execPath, [serverEntry], {
+            appendLog(`\n=== MoonTVPlus startup ${new Date().toISOString()} ===\n`);
+            appendLog(`Node: ${nodeExe}\nServer: ${serverEntry}\nPort: ${port}\n`);
+
+            serverProcess = spawn(nodeExe, [serverEntry], {
               cwd: serverDir,
               env,
               windowsHide: true,
               stdio: ['ignore', 'pipe', 'pipe'],
             });
 
-            serverProcess.stdout.on('data', (data) => console.log(`[server] ${data}`));
-            serverProcess.stderr.on('data', (data) => console.error(`[server] ${data}`));
-            serverProcess.on('exit', (code) => {
-              console.error(`MoonTVPlus server exited (code=${code})`);
-              if (!shuttingDown && mainWindow) {
-                dialog.showErrorBox('MoonTVPlus', `Local server exited unexpectedly (code=${code}).`);
-              }
-            });
+            const capture = (prefix, data) => {
+              const text = `${prefix}${data.toString()}`;
+              serverOutput = (serverOutput + text).slice(-12000);
+              appendLog(text);
+            };
+            serverProcess.stdout.on('data', (data) => capture('[stdout] ', data));
+            serverProcess.stderr.on('data', (data) => capture('[stderr] ', data));
 
             await waitForServer(port);
             return port;
@@ -194,7 +225,7 @@ jobs:
             try {
               await createWindow();
             } catch (error) {
-              console.error(error);
+              appendLog(`\n[fatal] ${error?.stack || String(error)}\n`);
               dialog.showErrorBox('MoonTVPlus startup failed', error?.stack || String(error));
               app.quit();
             }
@@ -225,7 +256,10 @@ jobs:
               "productName": "MoonTVPlus",
               "asar": true,
               "files": ["main.cjs", "runtime-config.json"],
-              "extraResources": [{ "from": "server", "to": "server" }],
+              "extraResources": [
+                { "from": "server", "to": "server" },
+                { "from": "node", "to": "node" }
+              ],
               "win": {
                 "target": [{ "target": "nsis", "arch": ["x64"] }]
               },
@@ -237,6 +271,26 @@ jobs:
             }
           }
           '@ | Set-Content -Path desktop-build/package.json -Encoding UTF8
+
+      - name: Smoke test standalone with bundled Node
+        shell: pwsh
+        run: |
+          $env:HOSTNAME = '127.0.0.1'
+          $env:PORT = '32109'
+          $proc = Start-Process -FilePath "desktop-build/node/node.exe" -ArgumentList "server.js" -WorkingDirectory "desktop-build/server" -PassThru -RedirectStandardOutput "desktop-build/smoke-out.log" -RedirectStandardError "desktop-build/smoke-err.log"
+          Start-Sleep -Seconds 5
+          if ($proc.HasExited) {
+            Write-Host 'Standalone server failed during CI smoke test.'
+            if (Test-Path desktop-build/smoke-out.log) { Get-Content desktop-build/smoke-out.log }
+            if (Test-Path desktop-build/smoke-err.log) { Get-Content desktop-build/smoke-err.log }
+            throw "MoonTVPlus standalone server exited with code $($proc.ExitCode)"
+          }
+          try {
+            Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:32109/" -TimeoutSec 15 | Out-Null
+            Write-Host 'Standalone smoke test passed.'
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Install desktop packaging dependencies
         working-directory: desktop-build
