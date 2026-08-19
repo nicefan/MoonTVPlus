@@ -66,6 +66,11 @@ jobs:
           Copy-Item -Recurse -Force .next/static desktop-build/server/.next/static
           if (Test-Path public) { Copy-Item -Recurse -Force public desktop-build/server/public }
 
+          # Next 14 standalone tracing can omit styled-jsx under pnpm.
+          # Resolve the real package location through Node and copy it into the
+          # standalone node_modules so server.js can resolve styled-jsx/package.json.
+          node -e "const fs=require('fs');const path=require('path');const src=path.dirname(require.resolve('styled-jsx/package.json'));const dst=path.resolve('desktop-build/server/node_modules/styled-jsx');fs.mkdirSync(path.dirname(dst),{recursive:true});fs.rmSync(dst,{recursive:true,force:true});fs.cpSync(src,dst,{recursive:true,dereference:true});console.log('Bundled styled-jsx:',src,'->',dst);"
+
           # Bundle the standard x64 Node runtime used by the build runner.
           # The installed desktop app therefore does NOT require Node.js to be installed.
           $nodeExe = (Get-Command node).Source
