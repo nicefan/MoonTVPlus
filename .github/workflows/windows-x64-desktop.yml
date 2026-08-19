@@ -66,24 +66,19 @@ jobs:
           Copy-Item -Recurse -Force .next/static desktop-build/server/.next/static
           if (Test-Path public) { Copy-Item -Recurse -Force public desktop-build/server/public }
 
-          # The pnpm + Next 14 standalone trace can omit transitive runtime modules
-          # such as styled-jsx and @swc/helpers. For the desktop build, install a
-          # complete, real production node_modules tree next to server.js instead
-          # of relying on the traced pnpm symlink structure.
+          # Install a complete real production dependency tree next to server.js.
           Copy-Item -Force package.json desktop-build/server/package.json
           Push-Location desktop-build/server
           if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
           npm install --omit=dev --no-audit --no-fund --legacy-peer-deps
           Pop-Location
 
-          if (!(Test-Path 'desktop-build/server/node_modules/next/package.json')) {
-            throw 'next runtime dependency was not installed correctly'
-          }
-          if (!(Test-Path 'desktop-build/server/node_modules/styled-jsx/package.json')) {
-            throw 'styled-jsx runtime dependency was not installed correctly'
-          }
-          if (!(Test-Path 'desktop-build/server/node_modules/@swc/helpers/package.json')) {
-            throw '@swc/helpers runtime dependency was not installed correctly'
+          foreach ($modulePath in @(
+            'desktop-build/server/node_modules/next/package.json',
+            'desktop-build/server/node_modules/styled-jsx/package.json',
+            'desktop-build/server/node_modules/@swc/helpers/package.json'
+          )) {
+            if (!(Test-Path $modulePath)) { throw "Missing runtime dependency before packaging: $modulePath" }
           }
 
           $nodeExe = (Get-Command node).Source
@@ -188,6 +183,9 @@ jobs:
 
             if (!fs.existsSync(serverEntry)) throw new Error(`Missing Next.js standalone server: ${serverEntry}`);
             if (!fs.existsSync(nodeExe)) throw new Error(`Missing bundled Node runtime: ${nodeExe}`);
+            if (!fs.existsSync(path.join(serverDir, 'node_modules', 'next', 'package.json'))) {
+              throw new Error(`Missing packaged Next runtime: ${path.join(serverDir, 'node_modules', 'next', 'package.json')}`);
+            }
 
             const env = {
               ...process.env,
@@ -269,10 +267,19 @@ jobs:
               "appId": "com.moontvplus.desktop",
               "productName": "MoonTVPlus",
               "asar": true,
+              "disableDefaultIgnoredFiles": true,
               "files": ["main.cjs", "runtime-config.json"],
               "extraResources": [
-                { "from": "server", "to": "server" },
-                { "from": "node", "to": "node" }
+                {
+                  "from": "server",
+                  "to": "server",
+                  "filter": ["**/*"]
+                },
+                {
+                  "from": "node",
+                  "to": "node",
+                  "filter": ["**/*"]
+                }
               ],
               "win": {
                 "target": [{ "target": "nsis", "arch": ["x64"] }]
@@ -319,6 +326,21 @@ jobs:
         working-directory: desktop-build
         shell: pwsh
         run: npx --no-install electron-builder --win nsis --x64
+
+      - name: Verify packaged server dependencies
+        shell: pwsh
+        run: |
+          $root = 'desktop-build/dist/win-unpacked/resources/server'
+          foreach ($modulePath in @(
+            "$root/server.js",
+            "$root/node_modules/next/package.json",
+            "$root/node_modules/styled-jsx/package.json",
+            "$root/node_modules/@swc/helpers/package.json"
+          )) {
+            Write-Host "Checking packaged file: $modulePath"
+            if (!(Test-Path $modulePath)) { throw "Packaged runtime file missing: $modulePath" }
+          }
+          Write-Host 'Packaged server dependency verification passed.'
 
       - name: Upload Windows x64 installer
         uses: actions/upload-artifact@v4
