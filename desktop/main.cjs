@@ -1,5 +1,5 @@
 const { app, BrowserWindow, dialog } = require('electron');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const extract = require('extract-zip');
 const fs = require('fs');
 const http = require('http');
@@ -9,6 +9,7 @@ const path = require('path');
 let serverProcess;
 let mainWindow;
 let serverOutput = '';
+let quitting = false;
 
 function ts() {
   return new Date().toISOString();
@@ -25,6 +26,86 @@ function appendLog(text) {
       .join('');
     if (lines) fs.appendFileSync(path.join(logDir, 'server.log'), lines);
   } catch (_) {}
+}
+
+function getPidFile() {
+  return path.join(app.getPath('userData'), 'server.pid');
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function killProcessTree(pid, reason = 'cleanup') {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  appendLog(`Stopping server process tree PID=${pid} reason=${reason}`);
+
+  if (process.platform === 'win32') {
+    const result = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+      windowsHide: true,
+      encoding: 'utf8',
+    });
+    if (result.stdout?.trim()) appendLog(`[taskkill stdout] ${result.stdout.trim()}`);
+    if (result.stderr?.trim()) appendLog(`[taskkill stderr] ${result.stderr.trim()}`);
+    appendLog(`taskkill exit code: ${result.status}`);
+    return;
+  }
+
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (_) {}
+}
+
+function cleanupStaleServerProcess() {
+  const pidFile = getPidFile();
+  if (!fs.existsSync(pidFile)) return;
+
+  try {
+    const pid = Number.parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
+    if (Number.isInteger(pid) && pid > 0 && isProcessAlive(pid)) {
+      appendLog(`Found stale server PID=${pid} from previous run`);
+      killProcessTree(pid, 'stale pid file');
+    }
+  } catch (error) {
+    appendLog(`Failed to inspect stale PID file: ${error?.message || error}`);
+  }
+
+  try {
+    fs.rmSync(pidFile, { force: true });
+  } catch (_) {}
+}
+
+function rememberServerPid(pid) {
+  try {
+    fs.writeFileSync(getPidFile(), String(pid));
+    appendLog(`Server PID recorded: ${pid}`);
+  } catch (error) {
+    appendLog(`Failed to record server PID ${pid}: ${error?.message || error}`);
+  }
+}
+
+function forgetServerPid(pid) {
+  try {
+    const pidFile = getPidFile();
+    if (!fs.existsSync(pidFile)) return;
+    const savedPid = Number.parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
+    if (!pid || savedPid === pid) fs.rmSync(pidFile, { force: true });
+  } catch (_) {}
+}
+
+function stopServer(reason = 'app quit') {
+  const pid = serverProcess?.pid;
+  if (pid) {
+    killProcessTree(pid, reason);
+    forgetServerPid(pid);
+  }
+  serverProcess = undefined;
 }
 
 function getFreePort() {
@@ -179,6 +260,12 @@ async function startServer() {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
+  rememberServerPid(serverProcess.pid);
+  serverProcess.once('exit', (code, signal) => {
+    appendLog(`Server process exited PID=${serverProcess?.pid || 'unknown'} code=${code} signal=${signal || 'none'}`);
+    forgetServerPid(serverProcess?.pid);
+  });
+
   const capture = (prefix, data) => {
     const text = `${prefix}${data.toString()}`;
     serverOutput = (serverOutput + text).slice(-12000);
@@ -210,9 +297,11 @@ async function createWindow() {
 
 app.whenReady().then(async () => {
   try {
+    cleanupStaleServerProcess();
     await createWindow();
   } catch (error) {
     appendLog(`[fatal] ${error?.stack || String(error)}`);
+    stopServer('startup failure');
     dialog.showErrorBox('MoonTVPlus startup failed', error?.stack || String(error));
     app.quit();
   }
@@ -223,5 +312,11 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
-  if (serverProcess && !serverProcess.killed) serverProcess.kill();
+  if (quitting) return;
+  quitting = true;
+  stopServer('before-quit');
+});
+
+process.on('exit', () => {
+  stopServer('process exit');
 });
