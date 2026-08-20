@@ -121,17 +121,6 @@ jobs:
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           }
 
-      - name: Archive server runtime
-        shell: pwsh
-        run: |
-          $zip = 'desktop/runtime/server.zip'
-          if (Test-Path $zip) { Remove-Item -Force $zip }
-          Compress-Archive -Path 'desktop/runtime/server/*' -DestinationPath $zip -CompressionLevel Optimal
-          if (!(Test-Path $zip)) { throw 'server.zip was not created' }
-          $sizeMb = [math]::Round((Get-Item $zip).Length / 1MB, 2)
-          Write-Host "server.zip size: $sizeMb MB"
-          Remove-Item -Recurse -Force 'desktop/runtime/server'
-
       - name: Install desktop packaging dependencies
         working-directory: desktop
         shell: pwsh
@@ -142,19 +131,22 @@ jobs:
         shell: pwsh
         run: npm run dist:win
 
-      - name: Verify packaged desktop resources
+      - name: Verify packaged desktop runtime
         shell: pwsh
         run: |
           $root = 'desktop/dist/win-unpacked/resources'
           foreach ($file in @(
-            "$root/server.zip",
+            "$root/server/server.js",
+            "$root/server/node_modules/next/package.json",
+            "$root/server/node_modules/styled-jsx/package.json",
+            "$root/server/node_modules/@swc/helpers/package.json",
             "$root/node/node.exe",
             "$root/runtime-config.json"
           )) {
             Write-Host "Checking packaged file: $file"
             if (!(Test-Path $file)) { throw "Packaged desktop resource missing: $file" }
           }
-          Write-Host 'Packaged desktop resource verification passed.'
+          Write-Host 'Packaged desktop runtime verification passed.'
 
       - name: Upload Windows x64 installer
         uses: actions/upload-artifact@v4
