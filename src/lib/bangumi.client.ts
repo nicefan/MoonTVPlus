@@ -65,6 +65,49 @@ export interface BangumiSubjectData {
   eps?: number;
 }
 
+// 时刻表（每日放送）数据结构 —— 对应 /api/bangumi/schedule
+export interface BangumiScheduleItem {
+  id: string;
+  name: string;
+  name_cn: string;
+  /** BGM 星期约定：0=周一 .. 6=周日。未知放送时间的条目也带星期 */
+  weekday: number;
+  /** 北京时间 HH:MM，仅匹配到精确放送时刻的条目有 */
+  time?: string;
+  /** 评分文本（一位小数），如 "8.1" */
+  rating?: string;
+  air_date?: string;
+  images?: {
+    large?: string;
+    common?: string;
+    medium?: string;
+    small?: string;
+    grid?: string;
+  };
+}
+
+export interface BangumiScheduleSlot {
+  time: string;
+  items: BangumiScheduleItem[];
+}
+
+export interface BangumiScheduleDay {
+  en: string;
+  cn: string;
+  slots: BangumiScheduleSlot[];
+  /** 该日未知放送时间（BGM 有星期但匹配不到精确时刻）的条目 */
+  unknown: BangumiScheduleItem[];
+}
+
+export interface BangumiScheduleData {
+  generatedAt: number;
+  season: string;
+  year: number;
+  days: BangumiScheduleDay[];
+  /** 未知放送时间（匹配不到 LiveChart 的条目），展示在最底部 */
+  unknown: BangumiScheduleItem[];
+}
+
 const BANGUMI_OFFICIAL_BASE_URL = 'https://api.bgm.tv';
 const SERVER_PROXY_BASE_URL = '/api/bangumi';
 
@@ -186,6 +229,22 @@ async function requestWithFallback<T>(path: string): Promise<T> {
 
 export async function GetBangumiCalendarData(): Promise<BangumiCalendarData[]> {
   return requestWithFallback<BangumiCalendarData[]>('/calendar');
+}
+
+/**
+ * 获取「每日放送」时刻表数据（周一到周日 + 未知放送时间）。
+ * 走自建 /api/bangumi/schedule 路由（服务端聚合 BGM 日历 + LiveChart）。
+ */
+export async function GetBangumiScheduleData(): Promise<BangumiScheduleData> {
+  const response = await fetch('/api/bangumi/schedule', {
+    signal: AbortSignal.timeout(30000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Bangumi 时刻表请求失败: ${response.status}`);
+  }
+
+  return response.json() as Promise<BangumiScheduleData>;
 }
 
 export async function getBangumiSubject(

@@ -11,6 +11,29 @@ export interface ChangelogEntry {
 
 export const changelog: ChangelogEntry[] = [
   {
+    version: "225.0.0",
+    date: "2026-08-20",
+    added: [
+    "鸿蒙端支持原生 HLS 切换与投屏",
+    "新增复制磁链",
+    "支持一键唤醒PC客户端",
+    "ai问片增加新协议",
+    "新增新番时刻表功能",
+    "管理面板新增tmdb默认图片地址配置",
+    "新增保存直播观看记录开关"
+    ],
+    changed: [
+    "搜索前高级显示显示方式，无权限时不显示只搜私人影库",
+    "修复私人影库的parse-torrent-name错误匹配名字",
+    "默认弹幕上限设置为5000"
+    ],
+    fixed: [
+    "修复videocard标题popup层级比来源数量角标低",
+    "修复网盘源PC右键无法显示原名",
+    "修复首页综艺查看更多跳转错误"
+    ]
+  },
+  {
     version: "224.2.0",
     date: "2026-08-03",
     added: [
