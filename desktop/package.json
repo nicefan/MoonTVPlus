@@ -6,9 +6,6 @@
   "scripts": {
     "dist:win": "electron-builder --win nsis --x64"
   },
-  "dependencies": {
-    "extract-zip": "2.0.1"
-  },
   "devDependencies": {
     "electron": "43.2.0",
     "electron-builder": "26.0.12"
@@ -17,15 +14,11 @@
     "appId": "com.moontvplus.desktop",
     "productName": "MoonTVPlus",
     "asar": true,
+    "afterPack": "./afterPack.cjs",
     "files": [
-      "main.cjs",
-      "node_modules/**/*"
+      "main.cjs"
     ],
     "extraResources": [
-      {
-        "from": "runtime/server.zip",
-        "to": "server.zip"
-      },
       {
         "from": "runtime/node/node.exe",
         "to": "node/node.exe"
