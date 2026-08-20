@@ -223,13 +223,45 @@ function findExtractedServerDir(root) {
   return null;
 }
 
+function getRuntimeBase() {
+  const localAppData = process.env.LOCALAPPDATA;
+  if (localAppData) return path.join(localAppData, 'MoonTVPlus', 'runtime');
+  return path.join(app.getPath('userData'), 'runtime');
+}
+
+function getReadyMarker(runtimeRoot) {
+  return path.join(runtimeRoot, '.ready.json');
+}
+
+function isRuntimeReady(runtimeRoot, buildId) {
+  const marker = getReadyMarker(runtimeRoot);
+  if (!fs.existsSync(marker)) return false;
+  try {
+    const meta = JSON.parse(fs.readFileSync(marker, 'utf8'));
+    if (meta.buildId !== buildId) return false;
+    return Boolean(findExtractedServerDir(runtimeRoot));
+  } catch (_) {
+    return false;
+  }
+}
+
+function markRuntimeReady(runtimeRoot, buildId, serverDir) {
+  fs.writeFileSync(getReadyMarker(runtimeRoot), JSON.stringify({
+    buildId,
+    serverDir: path.relative(runtimeRoot, serverDir) || '.',
+    readyAt: new Date().toISOString(),
+  }, null, 2));
+}
+
 async function ensureServerExtracted(config) {
   const buildId = config.BUILD_ID || 'unknown';
-  const runtimeBase = path.join(app.getPath('userData'), 'runtime');
+  const runtimeBase = getRuntimeBase();
   const runtimeRoot = path.join(runtimeBase, buildId);
-  const existing = findExtractedServerDir(runtimeRoot);
-  if (existing) {
+
+  if (isRuntimeReady(runtimeRoot, buildId)) {
+    const existing = findExtractedServerDir(runtimeRoot);
     setStartupStatus('运行环境已就绪', existing);
+    appendLog(`Reusing extracted runtime: ${existing}`);
     return existing;
   }
 
@@ -240,7 +272,7 @@ async function ensureServerExtracted(config) {
   const tempRoot = path.join(runtimeBase, `${buildId}.extract-${process.pid}-${Date.now()}`);
   fs.mkdirSync(tempRoot, { recursive: true });
 
-  setStartupStatus('首次启动，正在准备运行环境…', '正在解压服务文件，可能需要一些时间');
+  setStartupStatus('首次启动，正在准备运行环境…', '正在解压服务文件，仅首次或升级后执行');
   appendLog(`Extracting server archive to temporary directory: ${tempRoot}`);
   try {
     await extract(archive, { dir: tempRoot });
@@ -251,10 +283,17 @@ async function ensureServerExtracted(config) {
       throw new Error(`Extracted server runtime is invalid. Top-level entries: ${topLevel}`);
     }
 
-    const targetRoot = path.join(runtimeBase, `${buildId}-${Date.now()}`);
-    fs.renameSync(tempRoot, targetRoot);
-    const finalServerDir = findExtractedServerDir(targetRoot);
-    if (!finalServerDir) throw new Error(`Extracted runtime became invalid after activation: ${targetRoot}`);
+    // Activate atomically at a stable build-specific path. Previous code used a
+    // timestamped target, while startup looked only for runtime/<BUILD_ID>, which
+    // forced a full re-extraction on every launch.
+    if (fs.existsSync(runtimeRoot)) {
+      fs.rmSync(runtimeRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
+    }
+    fs.renameSync(tempRoot, runtimeRoot);
+
+    const finalServerDir = findExtractedServerDir(runtimeRoot);
+    if (!finalServerDir) throw new Error(`Extracted runtime became invalid after activation: ${runtimeRoot}`);
+    markRuntimeReady(runtimeRoot, buildId, finalServerDir);
 
     appendLog(`Activated extracted runtime: ${finalServerDir}`);
     return finalServerDir;
