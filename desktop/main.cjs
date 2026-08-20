@@ -1,6 +1,5 @@
 const { app, BrowserWindow, dialog } = require('electron');
 const { spawn } = require('child_process');
-const extract = require('extract-zip');
 const fs = require('fs');
 const http = require('http');
 const net = require('net');
@@ -57,7 +56,7 @@ function createSplashWindow() {
   const html = `<!doctype html><html><head><meta charset="utf-8"><title>MoonTVPlus</title><style>
     *{box-sizing:border-box}body{margin:0;background:#111827;color:#f9fafb;font-family:Segoe UI,Arial,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh}
     .box{width:420px}.title{font-size:28px;font-weight:650;margin-bottom:28px}.bar{height:4px;border-radius:4px;background:#374151;overflow:hidden;margin-bottom:22px}.bar:before{content:'';display:block;width:42%;height:100%;background:#f9fafb;animation:move 1.2s ease-in-out infinite}.status{font-size:16px;margin-bottom:8px}.detail{font-size:12px;color:#9ca3af;line-height:1.5;word-break:break-all}@keyframes move{0%{transform:translateX(-110%)}100%{transform:translateX(350%)}}
-  </style></head><body><div class="box"><div class="title">MoonTVPlus</div><div class="bar"></div><div id="status" class="status">正在启动…</div><div id="detail" class="detail">准备桌面运行环境</div></div><script>window.setStatus=function(v){document.getElementById('status').textContent=v.message||'';document.getElementById('detail').textContent=v.detail||''}</script></body></html>`;
+  </style></head><body><div class="box"><div class="title">MoonTVPlus</div><div class="bar"></div><div id="status" class="status">正在启动…</div><div id="detail" class="detail">准备本地服务</div></div><script>window.setStatus=function(v){document.getElementById('status').textContent=v.message||'';document.getElementById('detail').textContent=v.detail||''}</script></body></html>`;
 
   splashWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
   splashWindow.once('ready-to-show', () => splashWindow?.show());
@@ -82,54 +81,36 @@ function runTaskkill(pid, reason = 'cleanup') {
   return new Promise((resolve) => {
     if (!Number.isInteger(pid) || pid <= 0) return resolve();
     appendLog(`Stopping server process tree PID=${pid} reason=${reason}`);
-
     if (process.platform !== 'win32') {
       try { process.kill(pid, 'SIGTERM'); } catch (_) {}
       return resolve();
     }
-
     const child = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    child.stdout.on('data', (data) => appendLog(`[taskkill stdout] ${data.toString()}`));
-    child.stderr.on('data', (data) => appendLog(`[taskkill stderr] ${data.toString()}`));
-    child.once('error', (error) => {
-      appendLog(`taskkill failed PID=${pid}: ${error?.message || error}`);
-      resolve();
-    });
-    child.once('exit', (code) => {
-      appendLog(`taskkill exit code: ${code}`);
-      resolve();
-    });
+    child.once('error', () => resolve());
+    child.once('exit', () => resolve());
   });
 }
 
 async function cleanupStaleServerProcess() {
   const pidFile = getPidFile();
   if (!fs.existsSync(pidFile)) return;
-
   try {
     const pid = Number.parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
     if (Number.isInteger(pid) && pid > 0 && isProcessAlive(pid)) {
       setStartupStatus('正在清理上次残留进程…', `PID ${pid}`);
-      appendLog(`Found stale server PID=${pid} from previous run`);
       await runTaskkill(pid, 'stale pid file');
     }
   } catch (error) {
     appendLog(`Failed to inspect stale PID file: ${error?.message || error}`);
   }
-
   try { fs.rmSync(pidFile, { force: true }); } catch (_) {}
 }
 
 function rememberServerPid(pid) {
-  try {
-    fs.writeFileSync(getPidFile(), String(pid));
-    appendLog(`Server PID recorded: ${pid}`);
-  } catch (error) {
-    appendLog(`Failed to record server PID ${pid}: ${error?.message || error}`);
-  }
+  try { fs.writeFileSync(getPidFile(), String(pid)); } catch (_) {}
 }
 
 function forgetServerPid(pid) {
@@ -160,7 +141,7 @@ function getFreePort() {
   });
 }
 
-function waitForServer(port, timeoutMs = 120000) {
+function waitForServer(port, timeoutMs = 60000) {
   const startedAt = Date.now();
   return new Promise((resolve, reject) => {
     let finished = false;
@@ -185,12 +166,10 @@ function waitForServer(port, timeoutMs = 120000) {
         }
       });
       req.on('error', () => {
-        const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-        if (elapsed > 0 && elapsed % 5 === 0) setStartupStatus('正在等待本地服务…', `已等待 ${elapsed} 秒`);
         if (Date.now() - startedAt >= timeoutMs) {
           fail(new Error(`MoonTVPlus server did not start in time: 127.0.0.1:${port}\n\n${serverOutput || 'No server output was captured.'}`));
         } else {
-          setTimeout(probe, 400);
+          setTimeout(probe, 300);
         }
       });
       req.on('timeout', () => req.destroy());
@@ -204,114 +183,16 @@ function readRuntimeConfig() {
   return JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
 }
 
-function isValidServerDir(dir) {
-  return fs.existsSync(path.join(dir, 'server.js')) &&
-    fs.existsSync(path.join(dir, 'node_modules', 'next', 'package.json'));
-}
-
-function findExtractedServerDir(root) {
-  if (isValidServerDir(root)) return root;
-  const candidates = [path.join(root, 'server'), path.join(root, 'runtime', 'server')];
-  for (const candidate of candidates) if (isValidServerDir(candidate)) return candidate;
-  try {
-    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const candidate = path.join(root, entry.name);
-      if (isValidServerDir(candidate)) return candidate;
-    }
-  } catch (_) {}
-  return null;
-}
-
-function getRuntimeBase() {
-  const localAppData = process.env.LOCALAPPDATA;
-  if (localAppData) return path.join(localAppData, 'MoonTVPlus', 'runtime');
-  return path.join(app.getPath('userData'), 'runtime');
-}
-
-function getReadyMarker(runtimeRoot) {
-  return path.join(runtimeRoot, '.ready.json');
-}
-
-function isRuntimeReady(runtimeRoot, buildId) {
-  const marker = getReadyMarker(runtimeRoot);
-  if (!fs.existsSync(marker)) return false;
-  try {
-    const meta = JSON.parse(fs.readFileSync(marker, 'utf8'));
-    if (meta.buildId !== buildId) return false;
-    return Boolean(findExtractedServerDir(runtimeRoot));
-  } catch (_) {
-    return false;
-  }
-}
-
-function markRuntimeReady(runtimeRoot, buildId, serverDir) {
-  fs.writeFileSync(getReadyMarker(runtimeRoot), JSON.stringify({
-    buildId,
-    serverDir: path.relative(runtimeRoot, serverDir) || '.',
-    readyAt: new Date().toISOString(),
-  }, null, 2));
-}
-
-async function ensureServerExtracted(config) {
-  const buildId = config.BUILD_ID || 'unknown';
-  const runtimeBase = getRuntimeBase();
-  const runtimeRoot = path.join(runtimeBase, buildId);
-
-  if (isRuntimeReady(runtimeRoot, buildId)) {
-    const existing = findExtractedServerDir(runtimeRoot);
-    setStartupStatus('运行环境已就绪', existing);
-    appendLog(`Reusing extracted runtime: ${existing}`);
-    return existing;
-  }
-
-  const archive = path.join(process.resourcesPath, 'server.zip');
-  if (!fs.existsSync(archive)) throw new Error(`Missing packaged server archive: ${archive}`);
-
-  fs.mkdirSync(runtimeBase, { recursive: true });
-  const tempRoot = path.join(runtimeBase, `${buildId}.extract-${process.pid}-${Date.now()}`);
-  fs.mkdirSync(tempRoot, { recursive: true });
-
-  setStartupStatus('首次启动，正在准备运行环境…', '正在解压服务文件，仅首次或升级后执行');
-  appendLog(`Extracting server archive to temporary directory: ${tempRoot}`);
-  try {
-    await extract(archive, { dir: tempRoot });
-    setStartupStatus('正在校验运行环境…', '检查 Next.js 依赖');
-    const extractedServerDir = findExtractedServerDir(tempRoot);
-    if (!extractedServerDir) {
-      const topLevel = fs.existsSync(tempRoot) ? fs.readdirSync(tempRoot).join(', ') : '(missing)';
-      throw new Error(`Extracted server runtime is invalid. Top-level entries: ${topLevel}`);
-    }
-
-    // Activate atomically at a stable build-specific path. Previous code used a
-    // timestamped target, while startup looked only for runtime/<BUILD_ID>, which
-    // forced a full re-extraction on every launch.
-    if (fs.existsSync(runtimeRoot)) {
-      fs.rmSync(runtimeRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
-    }
-    fs.renameSync(tempRoot, runtimeRoot);
-
-    const finalServerDir = findExtractedServerDir(runtimeRoot);
-    if (!finalServerDir) throw new Error(`Extracted runtime became invalid after activation: ${runtimeRoot}`);
-    markRuntimeReady(runtimeRoot, buildId, finalServerDir);
-
-    appendLog(`Activated extracted runtime: ${finalServerDir}`);
-    return finalServerDir;
-  } catch (error) {
-    appendLog(`Runtime extraction failed: ${error?.stack || String(error)}`);
-    try { fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 }); } catch (_) {}
-    throw error;
-  }
-}
-
 async function startServer() {
-  setStartupStatus('正在准备本地服务…', '检查运行环境');
   const port = await getFreePort();
   const config = readRuntimeConfig();
-  const serverDir = await ensureServerExtracted(config);
+  const serverDir = path.join(process.resourcesPath, 'server');
   const serverEntry = path.join(serverDir, 'server.js');
   const nodeExe = path.join(process.resourcesPath, 'node', 'node.exe');
+  const nextPackage = path.join(serverDir, 'node_modules', 'next', 'package.json');
 
+  if (!fs.existsSync(serverEntry)) throw new Error(`Missing packaged server: ${serverEntry}`);
+  if (!fs.existsSync(nextPackage)) throw new Error(`Missing packaged Next runtime: ${nextPackage}`);
   if (!fs.existsSync(nodeExe)) throw new Error(`Missing bundled Node runtime: ${nodeExe}`);
 
   const env = {
@@ -322,11 +203,10 @@ async function startServer() {
     PORT: String(port),
   };
 
-  appendLog(`=== MoonTVPlus startup ===`);
+  appendLog('=== MoonTVPlus startup ===');
   appendLog(`Build: ${config.BUILD_ID || 'unknown'}`);
   appendLog(`Node: ${nodeExe}`);
   appendLog(`Server: ${serverEntry}`);
-  appendLog(`Port: ${port}`);
   setStartupStatus('正在启动 MoonTVPlus 服务…', `127.0.0.1:${port}`);
 
   serverProcess = spawn(nodeExe, [serverEntry], {
@@ -338,10 +218,7 @@ async function startServer() {
 
   const pid = serverProcess.pid;
   rememberServerPid(pid);
-  serverProcess.once('exit', (code, signal) => {
-    appendLog(`Server process exited PID=${pid || 'unknown'} code=${code} signal=${signal || 'none'}`);
-    forgetServerPid(pid);
-  });
+  serverProcess.once('exit', () => forgetServerPid(pid));
 
   const capture = (prefix, data) => {
     const text = `${prefix}${data.toString()}`;
@@ -399,11 +276,8 @@ app.on('before-quit', (event) => {
   event.preventDefault();
   if (quitCleanupStarted) return;
   quitCleanupStarted = true;
-  setStartupStatus('正在退出…', '清理本地服务进程');
-  appendLog('Application quit requested; waiting for server cleanup');
   stopServer('before-quit').finally(() => {
     quitting = true;
-    appendLog('Server cleanup finished; exiting application');
     app.exit(0);
   });
 });
