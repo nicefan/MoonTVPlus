@@ -1,6 +1,9 @@
 name: Build MoonTVPlus Windows x64 Desktop
 
 on:
+  push:
+    branches:
+      - desktop
   workflow_dispatch:
 
 permissions:
