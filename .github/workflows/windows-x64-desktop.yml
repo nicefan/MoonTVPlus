@@ -59,13 +59,34 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:PASSWORD)) { $missing += 'PASSWORD' }
           if ($missing.Count -gt 0) { throw "Missing GitHub Actions secrets: $($missing -join ', ')" }
 
+      # Next 14 output tracing is more reliable with a hoisted dependency layout.
+      # This only affects the CI installation layout; the packaged app still uses
+      # Next's minimal .next/standalone runtime rather than a full node_modules tree.
+      - name: Configure pnpm for Next standalone
+        shell: pwsh
+        run: pnpm config set node-linker hoisted --location project
+
       - name: Install MoonTVPlus dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Build MoonTVPlus standalone
         run: pnpm build
 
-      - name: Prepare desktop runtime
+      - name: Validate native standalone output
+        shell: pwsh
+        run: |
+          if (!(Test-Path '.next/standalone/server.js')) {
+            throw 'Next standalone server.js was not generated'
+          }
+          if (!(Test-Path '.next/standalone/node_modules')) {
+            throw 'Next standalone node_modules was not generated'
+          }
+
+          Push-Location '.next/standalone'
+          node -e "console.log('next:',require.resolve('next/package.json'));console.log('styled-jsx:',require.resolve('styled-jsx/package.json'));console.log('@swc/helpers:',require.resolve('@swc/helpers/package.json'))"
+          Pop-Location
+
+      - name: Prepare minimal desktop runtime
         shell: pwsh
         run: |
           $runtimeRoot = 'desktop/runtime'
@@ -76,16 +97,25 @@ jobs:
           New-Item -ItemType Directory -Force -Path $serverRoot | Out-Null
           New-Item -ItemType Directory -Force -Path $nodeRoot | Out-Null
 
-          Copy-Item -Recurse -Force .next/standalone/* $serverRoot/
-          New-Item -ItemType Directory -Force -Path "$serverRoot/.next" | Out-Null
-          Copy-Item -Recurse -Force .next/static "$serverRoot/.next/static"
-          if (Test-Path public) { Copy-Item -Recurse -Force public "$serverRoot/public" }
+          # Copy Next's native standalone tree exactly as generated.
+          # robocopy preserves the complete directory tree more reliably than
+          # Copy-Item wildcards and does not replace standalone node_modules.
+          robocopy '.next\standalone' $serverRoot /E /COPY:DAT /DCOPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -ge 8) { throw "robocopy standalone failed with exit code $LASTEXITCODE" }
 
-          Copy-Item -Force package.json "$serverRoot/package.json"
+          New-Item -ItemType Directory -Force -Path "$serverRoot/.next" | Out-Null
+          robocopy '.next\static' "$serverRoot\.next\static" /E /COPY:DAT /DCOPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -ge 8) { throw "robocopy static failed with exit code $LASTEXITCODE" }
+
+          if (Test-Path public) {
+            robocopy 'public' "$serverRoot\public" /E /COPY:DAT /DCOPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP
+            if ($LASTEXITCODE -ge 8) { throw "robocopy public failed with exit code $LASTEXITCODE" }
+          }
+
+          # Do NOT run npm install here. The runtime must remain the minimal
+          # dependency tree produced by Next output: standalone.
           Push-Location $serverRoot
-          if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
-          npm install --omit=dev --no-audit --no-fund --legacy-peer-deps
-          & node -e "console.log('next:',require.resolve('next/package.json'));console.log('styled-jsx:',require.resolve('styled-jsx/package.json'));console.log('@swc/helpers:',require.resolve('@swc/helpers/package.json'))"
+          node -e "console.log('runtime next:',require.resolve('next/package.json'));console.log('runtime styled-jsx:',require.resolve('styled-jsx/package.json'));console.log('runtime @swc/helpers:',require.resolve('@swc/helpers/package.json'))"
           Pop-Location
 
           $nodeExe = (Get-Command node).Source
@@ -101,7 +131,12 @@ jobs:
           } | ConvertTo-Json -Compress
           Set-Content -Path "$runtimeRoot/runtime-config.json" -Value $runtimeConfig -Encoding UTF8
 
-      - name: Smoke test prepared runtime
+          $serverSize = (Get-ChildItem $serverRoot -Recurse -File | Measure-Object -Property Length -Sum).Sum
+          $serverFiles = (Get-ChildItem $serverRoot -Recurse -File | Measure-Object).Count
+          Write-Host "Standalone runtime files: $serverFiles"
+          Write-Host "Standalone runtime size: $([math]::Round($serverSize / 1MB, 2)) MB"
+
+      - name: Smoke test native standalone runtime
         shell: pwsh
         run: |
           $env:HOSTNAME = '127.0.0.1'
@@ -109,14 +144,14 @@ jobs:
           $proc = Start-Process -FilePath "desktop/runtime/node/node.exe" -ArgumentList "server.js" -WorkingDirectory "desktop/runtime/server" -PassThru -RedirectStandardOutput "desktop/smoke-out.log" -RedirectStandardError "desktop/smoke-err.log"
           Start-Sleep -Seconds 7
           if ($proc.HasExited) {
-            Write-Host 'Desktop server failed during CI smoke test.'
+            Write-Host 'Native standalone server failed during CI smoke test.'
             if (Test-Path desktop/smoke-out.log) { Get-Content desktop/smoke-out.log }
             if (Test-Path desktop/smoke-err.log) { Get-Content desktop/smoke-err.log }
-            throw "MoonTVPlus desktop server exited with code $($proc.ExitCode)"
+            throw "MoonTVPlus standalone server exited with code $($proc.ExitCode)"
           }
           try {
             Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:32109/" -TimeoutSec 20 | Out-Null
-            Write-Host 'Desktop server smoke test passed.'
+            Write-Host 'Native standalone smoke test passed.'
           } finally {
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           }
@@ -131,7 +166,7 @@ jobs:
         shell: pwsh
         run: npm run dist:win
 
-      - name: Verify packaged desktop runtime
+      - name: Verify packaged minimal runtime
         shell: pwsh
         run: |
           $root = 'desktop/dist/win-unpacked/resources'
@@ -144,9 +179,9 @@ jobs:
             "$root/runtime-config.json"
           )) {
             Write-Host "Checking packaged file: $file"
-            if (!(Test-Path $file)) { throw "Packaged desktop resource missing: $file" }
+            if (!(Test-Path $file)) { throw "Packaged standalone runtime missing: $file" }
           }
-          Write-Host 'Packaged desktop runtime verification passed.'
+          Write-Host 'Packaged minimal standalone verification passed.'
 
       - name: Upload Windows x64 installer
         uses: actions/upload-artifact@v4
