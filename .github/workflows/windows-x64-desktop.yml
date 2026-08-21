@@ -66,9 +66,15 @@ jobs:
           if (Test-Path desktop/runtime) { Remove-Item -Recurse -Force desktop/runtime }
           New-Item -ItemType Directory -Force -Path desktop/runtime/server | Out-Null
           New-Item -ItemType Directory -Force -Path desktop/runtime/node | Out-Null
+
           robocopy '.next\standalone' 'desktop\runtime\server' /E /COPY:DAT /R:2 /W:1
-          if ($LASTEXITCODE -ge 8) { throw 'copy standalone failed' }
+          if ($LASTEXITCODE -ge 8) { throw "copy standalone failed: $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
+
           robocopy '.next\static' 'desktop\runtime\server\.next\static' /E /COPY:DAT /R:2 /W:1
+          if ($LASTEXITCODE -ge 8) { throw "copy static failed: $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
+
           Copy-Item (Get-Command node).Source 'desktop/runtime/node/node.exe'
 
       - name: Install desktop packaging dependencies
