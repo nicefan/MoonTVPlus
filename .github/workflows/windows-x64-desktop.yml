@@ -86,6 +86,13 @@ jobs:
 
           Copy-Item (Get-Command node).Source 'desktop/runtime/node/node.exe'
 
+          $runtimeConfig = @{
+            BUILD_ID = $env:BUILD_ID
+            NEXT_PUBLIC_STORAGE_TYPE = 'upstash'
+          } | ConvertTo-Json -Compress
+          Set-Content -Path 'desktop/runtime/runtime-config.json' -Value $runtimeConfig -Encoding UTF8
+          if (!(Test-Path 'desktop/runtime/runtime-config.json')) { throw 'runtime-config.json was not generated' }
+
       - name: Install desktop packaging dependencies
         working-directory: desktop
         run: npm install --include=dev --no-audit --no-fund
@@ -104,7 +111,8 @@ jobs:
             "$root/server/server.js",
             "$root/server/node_modules/next/package.json",
             "$root/server/node_modules/styled-jsx/package.json",
-            "$root/node/node.exe"
+            "$root/node/node.exe",
+            "$root/runtime-config.json"
           )) {
             if (!(Test-Path $file)) { throw "Packaged standalone runtime missing: $file" }
           }
