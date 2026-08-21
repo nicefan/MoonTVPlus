@@ -25,8 +25,8 @@ module.exports = async function afterPack(context) {
     path.join(target, 'server.js'),
     path.join(target, 'node_modules', 'next', 'package.json'),
     path.join(target, 'node_modules', 'styled-jsx', 'package.json'),
-    path.join(target, 'node_modules', '@swc', 'helpers', 'package.json'),
   ];
+
   for (const file of required) {
     if (!fs.existsSync(file)) throw new Error(`afterPack runtime copy missing: ${file}`);
   }
